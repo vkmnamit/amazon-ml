@@ -346,6 +346,7 @@ def cmd_train(args) -> int:
         f"[{time.time() - t0:.1f}s]")
 
     s1_ids = s1["entity_id"].to_numpy(dtype=object)
+    pool_ids = pool["entity_id"].to_numpy(dtype=object)
     ci, cj, _ = build_candidates(s1, pool, cfg, log=log)
     if ci.size == 0:
         log("[train] no candidates produced — check blocking config")
