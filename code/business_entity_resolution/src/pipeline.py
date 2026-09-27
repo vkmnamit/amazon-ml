@@ -437,7 +437,8 @@ def cmd_train(args) -> int:
             (gid_map[int(v)] for v in hb), dtype=np.int64, count=hb.size
         )
         truth_n = np.array(
-            [len(gt.get(str(v), ())) for v in hold_ids], dtype=np.float64
+            [len(gt.get(s1_ids_list[int(v)], ())) for v in hold_ids],
+            dtype=np.float64,
         )
         grid = np.round(np.arange(0.30, 0.901, 0.01), 4)
         thr, val = _tune_threshold(
