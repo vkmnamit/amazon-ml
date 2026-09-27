@@ -13,7 +13,9 @@
 # thrashing (8 GB+ swap, feature workers stalled below 20% CPU) at 48M
 # candidate pairs, so the defaults below are sized to stay inside ~6 GB RSS:
 #   * train 250k S1 x top_k 120  ~ 22M candidate pairs
-#   * predict     1.73M S1 x top_k 120  ~ 150M candidate pairs
+#   * predict     1.73M S1 x top_k 120  ~ 132M blocking pairs, which the
+#     similarity prefilter (name>=70 OR addr>=80, on by default) trims to
+#     ~77M — candidate_pairs.tsv must also fit the 512 MB submission cap.
 # Raise --top-k only with the free-RAM headroom to match (candidate count is
 # NOT scored on the leaderboard, but scoring time scales with it).
 set -x

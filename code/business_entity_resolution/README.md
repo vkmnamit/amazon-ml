@@ -1,7 +1,7 @@
 # Business Entity Resolution — ML Challenge 2026
 
-Runnable pipeline: blocking (candidate generation) → pair features → scoring →
-submission TSVs.
+Runnable pipeline: blocking (candidate generation) → similarity prefilter →
+pair features → scoring → submission TSVs.
 
 ## Structure
 
@@ -13,7 +13,8 @@ code/business_entity_resolution/
     ├── pipeline.py    # CLI entry point: predict / train / evaluate
     ├── normalize.py   # name/address normalisation, postal extraction
     ├── blocking.py    # multi-key blocking, popularity pruning, per-S1 cap
-    ├── features.py    # rapidfuzz pair features (multiprocess, fork-based)
+    ├── features.py    # rapidfuzz pair features + similarity prefilter
+                      #   (multiprocess, fork-based)
     ├── scorer.py      # trained model wrapper + heuristic fallback
     ├── metrics.py     # macro F_0.5 (challenge metric)
     ├── io_data.py     # TSV reading / submission writing
@@ -57,7 +58,10 @@ Then validate the outputs from the `student_resource/` directory:
 ```
 
 Useful flags: `--limit-s1 20000 --limit-pool 200000` for a fast smoke run,
-`--threshold`, `--top-k`, `--workers`.
+`--threshold`, `--top-k`, `--workers`, and the candidate prefilter
+`--prefilter-name` / `--prefilter-addr` (keep a pair when the name WRatio is
+≥ 70 **or** the address WRatio is ≥ 80; keeps `candidate_pairs.tsv` under the
+512 MB submission cap — set either to 0 to disable).
 
 ## Methodology
 

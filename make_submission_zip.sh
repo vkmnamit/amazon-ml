@@ -11,7 +11,7 @@
 # Run from anywhere:  bash make_submission_zip.sh
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-TEAM="EntityResolvers"
+TEAM="Team Socrates"
 STAGE="$ROOT/build_submission/${TEAM}_submission"
 ZIP="$ROOT/build_submission/${TEAM}_submission.zip"
 
@@ -34,7 +34,7 @@ cp "$ROOT/artifacts/model.pkl" "$ROOT/artifacts/threshold.json" "$STAGE/artifact
 rm -rf "$STAGE/code/business_entity_resolution/src/__pycache__"
 find "$STAGE" -name '.DS_Store' -delete
 
-( cd "$ROOT/build_submission" && zip -qr "$(basename "$ZIP")" "$(basename "$STAGE")" )
+( cd "$ROOT/build_submission" && zip -qr9 "$(basename "$ZIP")" "$(basename "$STAGE")" )
 echo "built: $ZIP"
 unzip -l "$ZIP" | tail -20
 du -sh "$ZIP"

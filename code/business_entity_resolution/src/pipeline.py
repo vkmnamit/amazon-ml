@@ -31,7 +31,7 @@ import numpy as np
 
 from .blocking import build_candidates
 from .config import BlockingConfig, ScoringConfig
-from .features import FEATURE_NAMES, compute_features
+from .features import FEATURE_NAMES, compute_features, prefilter_pairs
 from .io_data import load_ground_truth, load_source, write_pair_file
 from .metrics import macro_f05, parse_id_list
 from .scorer import Scorer, save_model
@@ -121,6 +121,43 @@ def cmd_predict(args) -> int:
 
     ci, cj, bstats = build_candidates(s1, pool, cfg, log=log)
 
+    # Worker-friendly column lists are needed by the similarity prefilter and
+    # the feature workers; the raw frames are freed right away (the normalised
+    # strings themselves are shared, not copied).
+    import gc
+
+    s1_cols = _pair_columns(s1)
+    pool_cols = _pair_columns(pool)
+    del s1, pool
+    gc.collect()
+
+    # --- similarity prefilter (candidate generation) ----------------------
+    # candidate_pairs.tsv must contain exactly what the model scores AND fit
+    # the platform's 512 MB upload cap; 132.4M pairs (1.73 GB raw, ~722 MB
+    # deflated) cannot. Rule: keep when the names agree (WRatio >=
+    # --prefilter-name) or the addresses agree (WRatio >= --prefilter-addr),
+    # so pairs matched purely through address/postal evidence survive. Measured
+    # on the previous full run: removes ~42% of pairs while losing
+    # 4,611 / 5,155,912 accepted links (0.089%).
+    keep = prefilter_pairs(
+        ci, cj, s1_cols, pool_cols,
+        min_name=args.prefilter_name,
+        min_addr=args.prefilter_addr,
+        # Single-process on purpose: forking the ~3 GB string heap 7 ways
+        # duplicates refcount-dirtied pages and thrashes a 16 GB box (observed
+        # 10+ GB swap); one core needs ~9 min for 132M pairs, clean.
+        workers=1,
+    )
+    n_raw = int(ci.size)
+    ci, cj = ci[keep], cj[keep]
+    log(
+        f"[prefilter] name>={args.prefilter_name:g} or addr>={args.prefilter_addr:g}: "
+        f"{n_raw:,} -> {ci.size:,} pairs "
+        f"({100.0 * (n_raw - ci.size) / max(n_raw, 1):.1f}% removed) "
+        f"[{time.time() - t0:.1f}s]"
+    )
+    del keep
+
     cand_path = os.path.join(out_dir, "candidate_pairs.tsv")
     rows, non_empty = write_pair_file(
         cand_path, s1_ids, pool_ids, ci, cj, header_name="candidate_entity_ids"
@@ -133,11 +170,8 @@ def cmd_predict(args) -> int:
     scorer = Scorer.load(args.model, threshold=args.threshold, cfg=ScoringConfig())
     log(f"[score] scorer={scorer.kind} threshold={scorer.threshold:.3f}")
 
-    # convert the frames to worker-friendly lists, then free the frames (the
-    # normalized strings themselves are shared, not copied)
-    s1_cols = _pair_columns(s1)
-    pool_cols = _pair_columns(pool)
-    del s1, pool
+    # s1_cols / pool_cols were built and the frames freed before the
+    # prefilter above; collect again in case anything still holds a reference.
     import gc
 
     gc.collect()
@@ -590,6 +624,12 @@ def main(argv=None) -> int:
     p.add_argument("--limit-pool", type=int, default=None,
                    help="smoke test: only first N rows per pool file")
     _add_blocking_args(p)
+    p.add_argument("--prefilter-name", type=float, default=70.0,
+                   help="similarity prefilter: keep a candidate when its name "
+                        "WRatio vs the S1 record is >= this (0 disables)")
+    p.add_argument("--prefilter-addr", type=float, default=80.0,
+                   help="similarity prefilter: keep a candidate when its "
+                        "address WRatio vs the S1 record is >= this (0 disables)")
     p.set_defaults(func=cmd_predict)
 
     p = sub.add_parser(

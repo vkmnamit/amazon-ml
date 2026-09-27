@@ -213,3 +213,69 @@ def compute_features(
     with ctx.Pool(processes=workers, initializer=_init_worker) as pool:
         for block in pool.imap(_compute_slice, tasks, chunksize=1):
             yield block
+
+
+# --------------------------------------------------------------------------
+# similarity prefilter (candidate-generation stage)
+# --------------------------------------------------------------------------
+def _prefilter_slice(t):
+    """Keep-mask for one chunk: keep if name WRatio >= min_name OR address
+    WRatio >= min_addr (a missing name/address scores 0, never a false pass)."""
+    s, e = t
+    ci, cj = _G["ci"], _G["cj"]
+    n1s, a1s = _G["s1"][0], _G["s1"][2]
+    n2s, a2s = _G["pool"][0], _G["pool"][2]
+    min_n, min_a = _G["min_name"], _G["min_addr"]
+    out = np.empty(e - s, dtype=bool)
+    for r in range(s, e):
+        p, q = int(ci[r]), int(cj[r])
+        if min_n <= 0:
+            out[r - s] = True
+            continue
+        na, nb = n1s[p], n2s[q]
+        keep = bool(na and nb and fuzz.WRatio(na, nb) >= min_n)
+        if not keep and min_a > 0:
+            aa, ab = a1s[p], a2s[q]
+            keep = bool(aa and ab and fuzz.WRatio(aa, ab) >= min_a)
+        out[r - s] = keep
+    return out
+
+
+def prefilter_pairs(
+    ci: np.ndarray,
+    cj: np.ndarray,
+    s1_cols: Tuple,
+    pool_cols: Tuple,
+    *,
+    min_name: float,
+    min_addr: float,
+    workers: int | None = None,
+    chunk: int = 250_000,
+) -> np.ndarray:
+    """Boolean keep-mask over ``ci``/``cj`` for the similarity prefilter.
+
+    Runs before feature extraction, so ``candidate_pairs.tsv`` stays exactly
+    what the model runs inference over.  Thresholds <= 0 disable that side of
+    the rule; both disabled returns all-True (prefilter off).
+    """
+    n = ci.shape[0]
+    if n == 0:
+        return np.zeros(0, dtype=bool)
+    if min_name <= 0 and min_addr <= 0:
+        return np.ones(n, dtype=bool)
+
+    workers = workers or max(1, (os.cpu_count() or 2) - 1)
+    tasks = [(s, min(s + chunk, n)) for s in range(0, n, chunk)]
+    _set_globals(ci, cj, s1_cols, pool_cols)
+    _G["min_name"] = min_name
+    _G["min_addr"] = min_addr
+
+    if workers <= 1:
+        parts = [_prefilter_slice(t) for t in tasks]
+    else:
+        import multiprocessing as mp
+
+        ctx = mp.get_context("fork")  # share string arrays copy-on-write
+        with ctx.Pool(processes=workers, initializer=_init_worker) as pool:
+            parts = list(pool.imap(_prefilter_slice, tasks, chunksize=1))
+    return np.concatenate(parts)

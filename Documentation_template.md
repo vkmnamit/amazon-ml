@@ -86,6 +86,8 @@ dataset/*/source{1,2,3}.tsv
    |  io_data.load_source       normalise once per record (name, address, postal)
    v
 blocking.build_candidates       country-scoped keys -> inverted index -> per-S1 top-k
+   |
+features.prefilter_pairs        name WRatio >= 70 OR addr WRatio >= 80 (§3.5)
    |                            == candidate_pairs.tsv (exactly what the model scores)
    v
 features.compute_features       18 rapidfuzz features, fork-parallel over chunks
@@ -162,14 +164,14 @@ What this table changed in our design:
   tokens (`services`, `limited`) let junk pairs outrank the single distinctive key
   that identifies the true partner.
 * Because `candidate_pairs.tsv` is not scored on the leaderboard, the cap is bounded
-  only by scoring time: `top_k = 120` is the largest setting that completes in about
-  an hour on the 16 GB laptop described in §6.
+  by scoring time and by the submission package's 512 MB upload limit (§3.5):
+  `top_k = 120` completes in about an hour on the 16 GB laptop described in §6.
 
 The extended families therefore ship **disabled**
 (`BlockingConfig.weak_keys = False`); the flag and the measurement are kept because
 the negative result is the useful part.
 
-### 3.3 Test-set candidate set
+### 3.3 Test-set candidate set (blocking output, before the prefilter)
 
 | Country | Source-1 rows | Candidate pairs | Pairs / S1 |
 | --- | --- | --- | --- |
@@ -181,7 +183,9 @@ the negative result is the useful part.
 1,719,199 / 1,732,544 Source-1 entities (99.2 %) get at least one candidate; the
 other 13,345 rows are emitted as singletons. The unseen France slice receives
 candidate density comparable to the labelled countries (73.5 vs 72.1 for US), i.e.
-blocking does not degrade on the open-set country.
+blocking does not degrade on the open-set country. After the §3.5 prefilter,
+77,024,761 of these pairs (58.2 %) ship in `candidate_pairs.tsv`, covering
+1,717,902 rows (99.15 %).
 
 ### 3.4 Blocking recall at the shipping config
 
@@ -192,6 +196,46 @@ uncapped key union reaches ≈0.81 pair recall, so the remaining ≈0.19 is genu
 hard: names rewritten between sources (`custom wealth services llc` ↔ `custom wealth
 llc partners`) and cross-script transliteration are the two families no
 string-overlap key reached.
+
+### 3.5 Similarity prefilter — fitting the package
+
+`candidate_pairs.tsv` must contain exactly what the model scores over *and* the
+zip holding it must fit the platform's 512 MB submission cap. The raw blocking
+output cannot: 132.4M pairs are 1.73 GB raw and ~722 MB deflated, because random
+digit entity IDs sit near the entropy floor (a `gzip -9` benchmark only reaches
+711 MB). Rather than rescore with a lower `--top-k` — which costs recall
+monotonically (§3.2) — a similarity gate runs between blocking and feature
+extraction: keep a pair when the names agree (`name WRatio >= 70`) **or** the
+addresses agree (`address WRatio >= 80`), so pairs matched purely through
+address/postal evidence survive.
+
+Both sides of the rule were measured on the full test set (459k-pair reservoir
+sample for keep rates; all 5,155,912 accepted links for loss rates):
+
+| Rule | Candidates kept | Package (zip) | Accepted links lost |
+| --- | --- | --- | --- |
+| name ≥ 60 (no address side) | 61.4 % | 478 MB | 4.16 % |
+| name ≥ 50 OR addr ≥ 85 | 83.8 % | 637 MB | 0.14 % |
+| name ≥ 60 OR addr ≥ 85 | 68.5 % | 529 MB | 0.15 % |
+| **name ≥ 70 OR addr ≥ 80** (shipping) | **58.2 % — 77,024,761 shipped** | **458 MB (measured)** | **0.089 % (4,611 links)** |
+
+(Non-shipping rows: reservoir-sample keep rates and estimated package size at
+the measured 5.6 bytes/pair deflate ratio; the shipping row is the full-run
+measurement — the built zip is 458,065,818 bytes = 437 MiB, cap 512 MB.)
+
+A name-only gate would be the wrong instrument: 3.4 % of currently accepted
+links have name `WRatio < 20` — cross-script and rewritten-name matches — and
+they survive only because the rule also fires on address similarity. The
+shipping rule removes ~42 % of candidates while losing 4,611 of 5,155,912
+accepted links (0.089 %), and adds ~11 minutes to a full predict (651 s of a
+28.3-minute run, single-core: forking the multi-GB string heap across workers
+thrashed 10+ GB of swap on this 16 GB box, so the prefilter runs `workers=1`).
+An A/B diff of `matching_results.tsv` against the pre-prefilter reference run
+confirms the effect is exactly the rule: 0 links added, 4,611 removed (every
+one rule-failing), every kept link rule-passing. It is a *candidate-generation*
+stage, applied before scoring, so `candidate_pairs.tsv`
+stays exactly the model's inference input (`--prefilter-name` /
+`--prefilter-addr`, either set to 0 disables it).
 
 
 ---
@@ -359,11 +403,11 @@ of entities versus a 5.6 % singleton prior).
 
 The training prior is 3.46 links per Source-1 entity and 5.6 % singletons
 (identical for US and India: 3.459 and 3.465 links/S1). On test the pipeline
-emits **2.976 links/S1 and 10.47 % singletons** (per-country breakdown in
+emits **2.973 links/S1 and 10.50 % singletons** (per-country breakdown in
 Appendix C): link density below the prior and singleton share above it, both in
 the direction implied by the tuned precision-heavy operating point (miss some
-true links, avoid false merges). The effect is largest in India (2.344 links/S1,
-14.54 % empty) and smallest in the unseen France slice (4.976 links/S1, 7.24 %
+true links, avoid false merges). The effect is largest in India (2.341 links/S1,
+14.59 % empty) and smallest in the unseen France slice (4.971 links/S1, 7.26 %
 empty). This is the expected, deliberate bias rather than a sign of a broken
 threshold — the threshold was chosen by the holdout F_0.5 sweep, never by
 fitting the prior.
@@ -372,9 +416,10 @@ fitting the prior.
 
 ## 6. Conclusion
 
-The pipeline resolves 1.73M query records against 10M pool records in ~53 minutes
-on a 16 GB laptop (load 90s + blocking 102s + candidate write 110s + scoring
-2,948s), using only the provided data: no external databases, geocoders
+The pipeline resolves 1.73M query records against 10M pool records in ~28 minutes
+on a 16 GB laptop (load 108s + blocking 119s + similarity prefilter 651s +
+candidate write 22s + feature/scoring 790s), using only the provided data: no
+external databases, geocoders
 or pretrained entity models are involved. The design is measurement-driven — the
 blocking ceiling, the F_0.5-versus-threshold curve and the feature ablation in §5.2
 were each produced by the same code that generates the submission, and each one
@@ -397,7 +442,7 @@ pandas, rapidfuzz, scikit-learn only — see `requirements.txt`):
 | --- | --- |
 | `src/normalize.py` | NFKC/punctuation normalisation, legal-suffix stripping, address-abbreviation expansion, script-agnostic postal extraction, consonant skeleton |
 | `src/blocking.py` | country-scoped key generation, in-process uint64 hashing, chunked inverted-index merge, popularity/product pruning, per-S1 top-k |
-| `src/features.py` | the 18 pair features (fork-parallel over chunks, int32 pair indices) |
+| `src/features.py` | similarity prefilter (§3.5) + the 18 pair features (fork-parallel over chunks, int32 pair indices) |
 | `src/scorer.py` | model wrapper (`P(match)`) + documented heuristic fallback |
 | `src/metrics.py` | macro F_0.5 (challenge formula, singleton rule) |
 | `src/io_data.py` | TSV loading / submission writing, one row per Source-1 entity |
@@ -419,7 +464,8 @@ PY=../../.venv/bin/python
 $PY -m src.pipeline train  --max-train-s1 250000 --top-k 120 \
                            --neg-sample 0.12 --workers 5
 
-# inference: blocking -> 18 features -> scoring -> both submission TSVs
+# inference: blocking -> similarity prefilter -> 18 features -> scoring -> TSVs
+# (prefilter defaults: --prefilter-name 70 --prefilter-addr 80 — see §3.5)
 $PY -m src.pipeline predict --top-k 120 --workers 6
 ```
 
@@ -436,17 +482,17 @@ $PY -m src.pipeline apply --threshold 0.925 \
 | | Value |
 | --- | --- |
 | Source-1 rows emitted | 1,732,544 (every test entity, required) |
-| Candidate pairs (`candidate_pairs.tsv`) | 132,381,328 (76.4 / S1) |
-| Source-1 rows with ≥1 candidate | 1,719,199 (99.23 %) |
-| Accepted links (`matching_results.tsv`) | 5,155,912 (2.976 / S1) |
-| Predicted singletons | 181,356 (10.47 %) |
-| Predicted multi-row entities | 1,551,188 (89.53 %) |
-| `matching_results` accepted / scored candidates | 3.9 % of 132.4M |
+| Candidate pairs (`candidate_pairs.tsv`) | 77,024,761 (44.5 / S1) |
+| Source-1 rows with ≥1 candidate | 1,717,902 (99.15 %) |
+| Accepted links (`matching_results.tsv`) | 5,151,301 (2.973 / S1) |
+| Predicted singletons | 181,919 (10.50 %) |
+| Predicted multi-row entities | 1,550,625 (89.50 %) |
+| `matching_results` accepted / scored candidates | 6.7 % of 77.0M post-prefilter candidates |
 | `utils/validate_submission.py` | **PASS** — no blocking issues found, safe to submit |
 | Independent structural check | PASS (0 order / 0 subset / 0 prefix / 0 duplicate violations) |
 
 Score distribution of the accepted pairs (from the `predict` log, threshold 0.900):
-4,424,671 pairs ≥ 0.95, 731,240 in 0.90–0.95 — the gap below 0.90 (393,598
+4,421,776 pairs ≥ 0.95, 729,524 in 0.90–0.95 — the gap below 0.90 (391,321
 pairs in 0.85–0.90) is the flat part of the curve in §4.2, so the operating
 point is not knife-edge.
 
@@ -454,34 +500,36 @@ point is not knife-edge.
 
 | Country | Source-1 rows | Predicted singletons | Empty % | Link cells | Links / S1 |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| India | 809,986 | 117,741 | 14.54 % | 1,898,816 | 2.344 |
-| US | 663,106 | 44,841 | 6.76 % | 1,966,042 | 2.965 |
-| France (unseen) | 259,452 | 18,774 | 7.24 % | 1,291,054 | 4.976 |
+| India | 809,986 | 118,204 | 14.59 % | 1,896,035 | 2.341 |
+| US | 663,106 | 44,872 | 6.77 % | 1,965,489 | 2.964 |
+| France (unseen) | 259,452 | 18,843 | 7.26 % | 1,289,777 | 4.971 |
 
 **Calibration check.** The training ground truth is uniform across the two
 labelled countries — 3.461 links/S1 and 5.58 % singletons for both US and
-India — while this submission predicts 2.976 links/S1 and 10.47 % singletons
+India — while this submission predicts 2.973 links/S1 and 10.50 % singletons
 overall. The over-production of predicted singletons is the recall limit showing
 up as output (blocking pair recall 0.744, matcher micro recall 0.672), not a
 threshold artefact: the threshold was set by the holdout F_0.5 sweep in §4.2,
 not by matching the prior. Because F_0.5 weights precision twice as heavily as
 recall, and predicted precision is the quantity the holdout measured at 0.920,
 staying on the precision-leaning side of the prior is the right trade for this
-metric. India's 14.5 % empty rate is the largest single contributor and
+metric. India's 14.6 % empty rate is the largest single contributor and
 identifies it as the slice with the most blocking headroom; France's density
-(4.976 links/S1) is materially above the labelled countries and is discussed in
+(4.971 links/S1) is materially above the labelled countries and is discussed in
 §3.3 — it receives the same candidate budget per entity, but no labelled slice
 exists to calibrate against, so it inherits the global threshold unmodified
 rather than a hand-tuned one.
 
 All figures above come from the `predict` log, and both output files were
-verified twice: by `utils/validate_submission.py` (PASS), and independently by a
-lockstep streaming pass over the two TSVs against `test_source1.tsv` — rows
-compared 1,732,544, order mismatches 0, matched-not-in-candidates violations 0,
-prefix violations 0, in-row duplicates 0. (`validate_submission.py` materialises
-all 132.4M candidate IDs as Python sets, so it needs several GB and a long
-runtime at this candidate volume; the streaming pass reaches the same verdict in
-O(row) memory.)
+verified three times: by `utils/validate_submission.py` (PASS), by an
+independent lockstep streaming pass over the two TSVs against `test_source1.tsv`
+— rows compared 1,732,544, order mismatches 0, matched-not-in-candidates
+violations 0, prefix violations 0, in-row duplicates 0 — and by an A/B diff of
+`matching_results.tsv` against the pre-prefilter reference run (0 links added,
+4,611 removed, every one failing the §3.5 rule). (`validate_submission.py`
+materialises all 77.0M candidate IDs as Python sets, so it needs several GB and
+a long runtime at this candidate volume; the streaming pass reaches the same
+verdict in O(row) memory.)
 
 
 ### D. Known limitations
