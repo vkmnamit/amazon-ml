@@ -8,4 +8,5 @@ output/*.npy
 output/*.tsv
 output_heuristic_059/
 *.tsv
+build_submission/
 

@@ -24,6 +24,10 @@ code/business_entity_resolution/
 
 From `code/business_entity_resolution/` (use the workspace venv):
 
+The submission package ships `artifacts/model.pkl` + `artifacts/threshold.json`
+one level up (`../../artifacts/`), so `predict` reproduces the submitted TSVs
+directly; run `train` only if you want to refit from scratch.
+
 ```bash
 PY=../../.venv/bin/python
 

@@ -352,23 +352,29 @@ into features rather than into keys.
 Practically, these are controlled by the precision-heavy threshold: at 0.900 micro
 precision is 0.920, i.e. ~1 in 12 accepted links is not a true match, and the
 resulting macro F_0.5 is maximised. Because the cost function values precision 2×,
-we deliberately sit on the conservative side of the curve (predicted empty ≈11 % of
-entities versus a 5.6 % singleton prior).
+we deliberately sit on the conservative side of the curve (predicted empty = 10.5 %
+of entities versus a 5.6 % singleton prior).
 
 ### 5.5 Calibration check against the priors
 
-The training prior is 3.46 links per Source-1 entity and 5.6 % singletons. On test
-the pipeline emits the figures reported in §B — link density is below the prior and
-the singleton share is above it, both in the direction implied by the tuned
-precision-heavy operating point (miss some true links, avoid false merges). This is
-the expected, deliberate bias rather than a sign of a broken threshold.
+The training prior is 3.46 links per Source-1 entity and 5.6 % singletons
+(identical for US and India: 3.459 and 3.465 links/S1). On test the pipeline
+emits **2.976 links/S1 and 10.47 % singletons** (per-country breakdown in
+Appendix C): link density below the prior and singleton share above it, both in
+the direction implied by the tuned precision-heavy operating point (miss some
+true links, avoid false merges). The effect is largest in India (2.344 links/S1,
+14.54 % empty) and smallest in the unseen France slice (4.976 links/S1, 7.24 %
+empty). This is the expected, deliberate bias rather than a sign of a broken
+threshold — the threshold was chosen by the holdout F_0.5 sweep, never by
+fitting the prior.
 
 ---
 
 ## 6. Conclusion
 
-The pipeline resolves 1.73M query records against 10M pool records in ~40 minutes
-on a 16 GB laptop, using only the provided data: no external databases, geocoders
+The pipeline resolves 1.73M query records against 10M pool records in ~53 minutes
+on a 16 GB laptop (load 90s + blocking 102s + candidate write 110s + scoring
+2,948s), using only the provided data: no external databases, geocoders
 or pretrained entity models are involved. The design is measurement-driven — the
 blocking ceiling, the F_0.5-versus-threshold curve and the feature ablation in §5.2
 were each produced by the same code that generates the submission, and each one
@@ -431,13 +437,52 @@ $PY -m src.pipeline apply --threshold 0.925 \
 | --- | --- |
 | Source-1 rows emitted | 1,732,544 (every test entity, required) |
 | Candidate pairs (`candidate_pairs.tsv`) | 132,381,328 (76.4 / S1) |
-| Source-1 rows with ≥1 candidate | 1,719,199 (99.2 %) |
-| Accepted links (`matching_results.tsv`) | see below |
-| Predicted singletons | see below |
-| Validator (`utils/validate_submission.py`) | PASS |
+| Source-1 rows with ≥1 candidate | 1,719,199 (99.23 %) |
+| Accepted links (`matching_results.tsv`) | 5,155,912 (2.976 / S1) |
+| Predicted singletons | 181,356 (10.47 %) |
+| Predicted multi-row entities | 1,551,188 (89.53 %) |
+| `matching_results` accepted / scored candidates | 3.9 % of 132.4M |
+| `utils/validate_submission.py` | **PASS** — no blocking issues found, safe to submit |
+| Independent structural check | PASS (0 order / 0 subset / 0 prefix / 0 duplicate violations) |
 
-Fill-in values are taken directly from the `predict` log; the two TSVs are
-byte-for-byte the files produced by the commands in §B.
+Score distribution of the accepted pairs (from the `predict` log, threshold 0.900):
+4,424,671 pairs ≥ 0.95, 731,240 in 0.90–0.95 — the gap below 0.90 (393,598
+pairs in 0.85–0.90) is the flat part of the curve in §4.2, so the operating
+point is not knife-edge.
+
+**Per-country breakdown (test):**
+
+| Country | Source-1 rows | Predicted singletons | Empty % | Link cells | Links / S1 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| India | 809,986 | 117,741 | 14.54 % | 1,898,816 | 2.344 |
+| US | 663,106 | 44,841 | 6.76 % | 1,966,042 | 2.965 |
+| France (unseen) | 259,452 | 18,774 | 7.24 % | 1,291,054 | 4.976 |
+
+**Calibration check.** The training ground truth is uniform across the two
+labelled countries — 3.461 links/S1 and 5.58 % singletons for both US and
+India — while this submission predicts 2.976 links/S1 and 10.47 % singletons
+overall. The over-production of predicted singletons is the recall limit showing
+up as output (blocking pair recall 0.744, matcher micro recall 0.672), not a
+threshold artefact: the threshold was set by the holdout F_0.5 sweep in §4.2,
+not by matching the prior. Because F_0.5 weights precision twice as heavily as
+recall, and predicted precision is the quantity the holdout measured at 0.920,
+staying on the precision-leaning side of the prior is the right trade for this
+metric. India's 14.5 % empty rate is the largest single contributor and
+identifies it as the slice with the most blocking headroom; France's density
+(4.976 links/S1) is materially above the labelled countries and is discussed in
+§3.3 — it receives the same candidate budget per entity, but no labelled slice
+exists to calibrate against, so it inherits the global threshold unmodified
+rather than a hand-tuned one.
+
+All figures above come from the `predict` log, and both output files were
+verified twice: by `utils/validate_submission.py` (PASS), and independently by a
+lockstep streaming pass over the two TSVs against `test_source1.tsv` — rows
+compared 1,732,544, order mismatches 0, matched-not-in-candidates violations 0,
+prefix violations 0, in-row duplicates 0. (`validate_submission.py` materialises
+all 132.4M candidate IDs as Python sets, so it needs several GB and a long
+runtime at this candidate volume; the streaming pass reaches the same verdict in
+O(row) memory.)
+
 
 ### D. Known limitations
 
