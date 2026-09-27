@@ -1,6 +1,10 @@
 """Pair-wise feature computation (rapidfuzz), multiprocess over chunks.
 
-Features (float32, all in [0, 1]):
+Features (float32, all in [0, 1]) — see ``FEATURE_NAMES`` for the authoritative
+order. Columns 0-6 are the original legacy block (kept byte-compatible so older
+artifacts and the heuristic fallback keep working); 7-17 were added after the
+first leaderboard feedback to give the model more ways to separate
+abbreviation / word-order / transliteration variants from genuine non-matches:
 
 0. name_token_set_core  token_set_ratio on suffix-stripped core names
 1. name_token_sort      token_sort_ratio on full normalised names
@@ -10,6 +14,17 @@ Features (float32, all in [0, 1]):
 4. addr_ratio           plain ratio on addresses (0 if either missing)
 5. addr_both_present    1.0 when both addresses exist, else 0.0
 6. postal_match         1.0 when both postal codes exist and are equal
+7. name_wratio_core     WRatio on core names (best-of partial/token/ratio)
+8. name_tset_full       token_set_ratio on full names
+9. name_exact           1.0 when normalised names are identical
+10. core_exact          1.0 when suffix-stripped core names are identical
+11. skel_exact          1.0 when consonant skeletons agree (transliteration)
+12. addr_wratio         WRatio on addresses
+13. addr_tset           token_set_ratio on addresses (component reordering)
+14. addr_exact          1.0 when normalised addresses are identical
+15. postal_prefix3      1.0 when postal region prefixes agree
+16. name_len_ratio      min/max token count of the two names
+17. addr_len_ratio      min/max token count of the two addresses
 
 Memory notes: pair indices are int32 (never stacked into an int64 matrix) and
 strings live in plain Python lists — both matter at 10M+ rows on a 16 GB box.
@@ -25,16 +40,36 @@ from typing import Tuple
 import numpy as np
 from rapidfuzz import fuzz
 
+from .normalize import name_skeleton
+
 FEATURE_NAMES = [
-    "name_token_set_core",
-    "name_token_sort",
-    "name_ratio",
-    "addr_token_sort",
-    "addr_ratio",
-    "addr_both_present",
-    "postal_match",
+    # --- legacy block (indices 0-6 keep their original meaning) ---
+    "name_token_set_core",   # 0  token_set_ratio on suffix-stripped core names
+    "name_token_sort",       # 1  token_sort_ratio on full normalised names
+    "name_ratio",            # 2  plain ratio on full normalised names
+    "addr_token_sort",       # 3  token_sort_ratio on addresses (0 if missing)
+    "addr_ratio",            # 4  plain ratio on addresses (0 if missing)
+    "addr_both_present",     # 5  1.0 when both addresses exist
+    "postal_match",          # 6  1.0 when both postal codes exist and are equal
+    # --- added: name robustness ---
+    "name_wratio_core",      # 7  WRatio on core names (best-of combination)
+    "name_tset_full",        # 8  token_set_ratio on full names
+    "name_exact",            # 9  1.0 when normalised names are identical
+    "core_exact",            # 10 1.0 when core names are identical
+    "skel_exact",            # 11 1.0 when consonant skeletons agree (translit)
+    # --- added: address robustness ---
+    "addr_wratio",           # 12 WRatio on normalised addresses
+    "addr_tset",             # 13 token_set_ratio (component reordering)
+    "addr_exact",            # 14 1.0 when normalised addresses are identical
+    # --- added: geo / shape ---
+    "postal_prefix3",        # 15 1.0 when postal prefixes (region) agree
+    "name_len_ratio",        # 16 min/max token count of the two names
+    "addr_len_ratio",        # 17 min/max token count of the two addresses
 ]
 N_FEATURES = len(FEATURE_NAMES)
+
+# explicit indices (the model consumes the matrix by column order)
+IDX = {name: i for i, name in enumerate(FEATURE_NAMES)}
 
 # per-worker globals (set in the parent just before forking)
 _G: dict = {}
@@ -61,25 +96,74 @@ def _core(norm: str, k: int) -> str:
     return parts[0] if len(parts) == k + 1 else ""
 
 
+def _len_ratio(s1: str, s2: str) -> float:
+    """min/max token-count ratio of two strings (0.0 when either is empty)."""
+    if not s1 or not s2:
+        return 0.0
+    n1 = s1.count(" ") + 1
+    n2 = s2.count(" ") + 1
+    return min(n1, n2) / max(n1, n2)
+
+
+def _skeleton(text: str) -> str:
+    """Consonant skeleton of a whole normalised string (transliteration key)."""
+    return "".join(name_skeleton(t) for t in text.split())
+
+
 def _feat_row(n1, k1, a1, p1, n2, k2, a2, p2):
     # guard: token_set_ratio("", "") == 100 would be a false "perfect" match
     c1 = _core(n1, k1)
     c2 = _core(n2, k2)
-    if c1 and c2:
+    have_n = bool(n1 and n2)
+    have_c = bool(c1 and c2)
+    have_a = bool(a1 and a2)
+
+    # ---- name block -------------------------------------------------------
+    if have_c:
         f0 = fuzz.token_set_ratio(c1, c2)
+        f7 = fuzz.WRatio(c1, c2)
+    elif have_n:
+        f0 = fuzz.ratio(n1, n2)
+        f7 = fuzz.WRatio(n1, n2)
     else:
-        f0 = fuzz.ratio(n1, n2) if (n1 and n2) else 0.0
-    f1 = fuzz.token_sort_ratio(n1, n2) if (n1 and n2) else 0.0
-    f2 = fuzz.ratio(n1, n2) if (n1 and n2) else 0.0
-    if a1 and a2:
+        f0 = f7 = 0.0
+    if have_n:
+        f1 = fuzz.token_sort_ratio(n1, n2)
+        f2 = fuzz.ratio(n1, n2)
+        f8 = fuzz.token_set_ratio(n1, n2)
+    else:
+        f1 = f2 = f8 = 0.0
+    f9 = 100.0 if (have_n and n1 == n2) else 0.0
+    f10 = 100.0 if (have_c and c1 == c2) else 0.0
+    f11 = 100.0 if (have_c and _skeleton(c1) == _skeleton(c2)) else 0.0
+    f16 = 100.0 * _len_ratio(n1, n2)
+
+    # ---- address block ----------------------------------------------------
+    if have_a:
         f3 = fuzz.token_sort_ratio(a1, a2)
         f4 = fuzz.ratio(a1, a2)
+        f12 = fuzz.WRatio(a1, a2)
+        f13 = fuzz.token_set_ratio(a1, a2)
+        f14 = 100.0 if a1 == a2 else 0.0
+        f17 = 100.0 * _len_ratio(a1, a2)
         f5 = 100.0
     else:
-        f3 = f4 = 0.0
+        f3 = f4 = f12 = f13 = f14 = f17 = 0.0
         f5 = 0.0
+
+    # ---- geo --------------------------------------------------------------
     f6 = 100.0 if (p1 and p2 and p1 == p2) else 0.0
-    return (f0, f1, f2, f3, f4, f5, f6)
+    if p1 and p2 and len(p1) >= 3 and len(p2) >= 3:
+        f15 = 100.0 if p1[:3] == p2[:3] else 0.0
+    else:
+        f15 = 0.0
+
+    return (
+        f0, f1, f2, f3, f4, f5, f6,
+        f7, f8, f9, f10, f11,
+        f12, f13, f14,
+        f15, f16, f17,
+    )
 
 
 def _compute_slice(args: Tuple[int, int]) -> np.ndarray:

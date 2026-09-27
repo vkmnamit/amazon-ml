@@ -40,9 +40,23 @@ S1_CHUNK = 100_000  # S1 records per blocking chunk
 
 
 def record_keys(
-    country: str, name_norm: str, addr_norm: str, postal: str
+    country: str, name_norm: str, addr_norm: str, postal: str, weak: bool = True
 ) -> List[str]:
-    """Blocking keys for one record (country-scoped)."""
+    """Blocking keys for one record (country-scoped).
+
+    ``weak=False`` emits only the four original per-record families
+    (``p`` postal, ``n``/``n2`` leading-token prefixes, ``v`` consonant
+    skeleton, ``s`` sorted full token set, ``a`` house-number+street). They are
+    cheap and information-dense: measured on a 20k-entity train sample they
+    beat the extended families at any fixed per-entity candidate budget
+    (pair recall 0.734 @ 38 candidates/S1 vs 0.720 @ 58), because the extra
+    low-information keys crowd out strong-key candidates in the top-k ranking.
+
+    ``weak=True`` additionally emits the coverage families (``w`` length-ranked
+    5-token windows, ``o`` original-order 4-grams, ``u`` unigrams, ``b``
+    significant token pairs). They buy recall only at a much larger budget
+    (pair recall 0.775 @ 106 candidates/S1) and are therefore opt-in.
+    """
     keys: List[str] = []
     if postal:
         keys.append(f"p|{country}|{postal}")
@@ -60,11 +74,53 @@ def record_keys(
         sig = sorted({t for t in toks if len(t) >= 2})[:8]
         if sig:
             keys.append("s|{}|{}".format(country, " ".join(sig)[:60]))
+        if not weak:
+            return _address_keys(keys, country, addr_norm)
+        # --- coverage families (opt-in, see docstring) ---------------------
+        sig_all = sorted({t for t in toks})
+        # w1: length-ranked window (keeps long distinctive tokens together —
+        # catches one extra/missing token on either side).
+        if len(sig_all) > 3:
+            Swin = sorted(sig_all, key=len, reverse=True)
+            for ws in range(max(len(Swin) - 4, 1)):
+                win = sorted(Swin[ws:ws + 5])
+                keys.append("w|{}|{}".format(country, "+".join(win)[:90]))
+        # w2: ORIGINAL-ORDER sliding 4-grams (word-order/local-phrase robust:
+        # an insertion elsewhere in the name doesn't shift the surviving
+        # window, unlike the sorted full set).
+        if len(toks) >= 4:
+            for ws in range(len(toks) - 3):
+                win = sorted(toks[ws:ws + 4])
+                keys.append("o|{}|{}".format(country, "+".join(win)[:90]))
+        # w3: UNIGRAM fallback — every single significant token with len>=4.
+        # Threshold at 4 (not 5): the failing true pairs share short stubs
+        # like "moore","prabhav","dermatology","green","chapel","center".
+        # Common words ("services","limited","private") are pruned away by
+        # pool/product frequency caps automatically.
+        for t in set(toks):
+            if len(t) >= 4:
+                keys.append(f"u|{country}|{t[:8]}")
+        # SUBSET fallback: every 2-combination of significant tokens.
+        # Catches pairs that share only a rare 2-token core (e.g. test-side
+        # DBA name vs registry name, missing middle tokens). Bounded: a
+        # 6-token core emits 15 short keys; rare keys survive pruning.
+        big = [t for t in sig_all if len(t) >= 4]
+        if len(big) >= 2:
+            for ia in range(len(big)):
+                ta = big[ia]
+                for tb in big[ia + 1:]:
+                    a, b = (ta, tb) if ta < tb else (tb, ta)
+                    keys.append(f"b|{country}|{a[:6]}+{b[:6]}")
 
+    return _address_keys(keys, country, addr_norm)
+
+
+def _address_keys(keys: List[str], country: str, addr_norm: str) -> List[str]:
+    """Append the house-number + street-token key for one address."""
     atoks = addr_norm.split()
     for idx, t in enumerate(atoks):
         if t.isdigit():
-            for st in atoks[idx + 1 :]:
+            for st in atoks[idx + 1:]:
                 if len(st) >= 3 and not st.isdigit():
                     keys.append(f"a|{country}|{t}|{st[:5]}")
                     break
@@ -72,7 +128,7 @@ def record_keys(
     return keys
 
 
-def _keys_for_frame(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+def _keys_for_frame(df: pd.DataFrame, weak: bool = True) -> Tuple[np.ndarray, np.ndarray]:
     """Explode a frame into (hashed_keys uint64, owner local-index int32).
 
     Keys of the same owner are contiguous (built in row order), which the
@@ -90,7 +146,7 @@ def _keys_for_frame(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
         key_buf: List[int] = []
         idx_buf: List[int] = []
         for i in range(start, stop):
-            ks = record_keys(countries[i], norms[i], addrs[i], postals[i])
+            ks = record_keys(countries[i], norms[i], addrs[i], postals[i], weak)
             # mask keeps the hash non-negative so it fits uint64 cleanly
             key_buf.extend([hash(k) & 0x7FFFFFFFFFFFFFFF for k in ks])
             idx_buf.extend([i] * len(ks))
@@ -212,8 +268,8 @@ def build_candidates(
         s1_sub = s1.iloc[s1_local].reset_index(drop=True)
         pool_sub = pool.iloc[pool_local].reset_index(drop=True)
 
-        k1, own1 = _keys_for_frame(s1_sub)
-        kp, ownp = _keys_for_frame(pool_sub)
+        k1, own1 = _keys_for_frame(s1_sub, cfg.weak_keys)
+        kp, ownp = _keys_for_frame(pool_sub, cfg.weak_keys)
         del s1_sub, pool_sub
         if k1.size == 0 or kp.size == 0:
             log(f"[blocking] {country}: no keys, skipping")

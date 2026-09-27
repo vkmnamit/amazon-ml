@@ -15,9 +15,16 @@ class BlockingConfig:
         of distinct blocking keys shared).
     """
 
-    max_pool_per_key: int = 400
-    max_prod_per_key: int = 20_000
-    top_k: int = 60
+    max_pool_per_key: int = 2000
+    max_prod_per_key: int = 200_000
+    top_k: int = 120
+    # Emit the low-information "coverage" key families (unigrams, token pairs,
+    # token windows). Measured on a 20k-entity train sample: ON costs 2.8x the
+    # candidates for +0.04 pair recall; at an equal per-entity budget OFF wins
+    # (0.734 @ 38 cands/S1 vs 0.720 @ 58). Default OFF — candidate volume is
+    # only bounded by scoring time, and the pairs it adds are near-threshold
+    # junk the model has to reject anyway.
+    weak_keys: bool = False
 
 
 @dataclass

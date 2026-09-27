@@ -10,19 +10,9 @@ from typing import Optional
 import numpy as np
 
 from .config import ScoringConfig
-from .features import N_FEATURES
+from .features import FEATURE_NAMES, N_FEATURES
 
-MODEL_FEATURE_INDEX = {name: i for i, name in enumerate(
-    [
-        "name_token_set_core",
-        "name_token_sort",
-        "name_ratio",
-        "addr_token_sort",
-        "addr_ratio",
-        "addr_both_present",
-        "postal_match",
-    ]
-)}
+MODEL_FEATURE_INDEX = {name: i for i, name in enumerate(FEATURE_NAMES)}
 
 
 def heuristic_scores(X: np.ndarray) -> np.ndarray:

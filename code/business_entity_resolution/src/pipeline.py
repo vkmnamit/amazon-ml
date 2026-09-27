@@ -91,6 +91,7 @@ def cmd_predict(args) -> int:
         max_pool_per_key=args.max_pool_per_key,
         max_prod_per_key=args.max_prod_per_key,
         top_k=args.top_k,
+        weak_keys=args.weak_keys,
     )
     out_dir = args.output_dir
     os.makedirs(out_dir, exist_ok=True)
@@ -280,6 +281,48 @@ def _holdout_mask(s1_ids: np.ndarray, frac: float) -> np.ndarray:
     return keep
 
 
+def _report_curve(scores, correct, group_id, n_groups, truth_n,
+                  grid=None) -> None:
+    """Print the precision/recall/F_0.5 trade-off at a range of thresholds.
+
+    ``scores``/``correct``/``group_id`` are aligned per candidate pair (all
+    candidate pairs of the evaluated split, not a subsample). ``truth_n`` is the
+    number of true matches per entity (0 for singletons).
+    """
+    if grid is None:
+        grid = np.arange(0.50, 0.96, 0.025)
+    b2 = 0.25
+    log("[train] threshold sweep (macro over entities; F0.5 weights P 2x):")
+    log("         thr    macroF0.5   microP   microR   microF0.5    links/S1  empty")
+    best = (float("nan"), -1.0)
+    for t in grid:
+        m = scores >= t
+        g = group_id[m]
+        c = correct[m]
+        pred_n = np.bincount(g, minlength=n_groups).astype(np.float64)
+        tp = np.bincount(g, weights=c, minlength=n_groups)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            prec = np.where(pred_n > 0, tp / np.maximum(pred_n, 1), 0.0)
+            rec = np.where(truth_n > 0, tp / np.maximum(truth_n, 1), 0.0)
+        f = np.where(
+            (pred_n > 0) | (truth_n > 0),
+            (1 + b2) * prec * rec / np.maximum(b2 * prec + rec, 1e-12),
+            1.0,
+        )
+        macro = float(f.mean())
+        P = float(tp.sum() / max(pred_n.sum(), 1))
+        R = float(tp.sum() / max(truth_n.sum(), 1))
+        F = 1.25 * P * R / max(b2 * P + R, 1e-12)
+        non_empty = int((pred_n > 0).sum())
+        links = float(pred_n.sum() / max(non_empty, 1))
+        empty = n_groups - non_empty
+        log(f"        {t:.3f}   {macro:.5f}   {P:.4f}   {R:.4f}   {F:.5f}   "
+            f"{links:8.2f}  {empty:>6d}")
+        if macro > best[1]:
+            best = (float(t), macro)
+    log(f"[train] best sweep threshold={best[0]:.3f} macro-F0.5={best[1]:.5f}")
+
+
 def _tune_threshold(scores, correct, group_id, n_groups, truth_n, grid):
     """Grid-search the accept threshold maximising macro F_0.5 on a split.
 
@@ -336,6 +379,7 @@ def cmd_train(args) -> int:
         max_pool_per_key=args.max_pool_per_key,
         max_prod_per_key=args.max_prod_per_key,
         top_k=args.top_k,
+        weak_keys=args.weak_keys,
     )
     s1 = load_source(needed[0], limit=args.limit_s1)
     pool = pd.concat(
@@ -405,6 +449,11 @@ def cmd_train(args) -> int:
                 (blk_i[is_hold].copy(), y[is_hold].copy(), X[is_hold])
             )
         offset = stop
+        # progress: feature computation dominates `train` wall time
+        if offset % 5_000_000 < X.shape[0]:
+            kept = sum(a.shape[0] for a in X_keep)
+            log(f"[train] features {offset:,}/{ci.size:,} pairs, "
+                f"kept_rows={kept:,} [{time.time() - t0:.0f}s]")
 
     Xtr = np.concatenate(X_keep) if X_keep else np.empty((0, len(FEATURE_NAMES)))
     ytr = np.concatenate(y_keep) if y_keep else np.empty(0)
@@ -429,22 +478,45 @@ def cmd_train(args) -> int:
         hb = np.empty((0, 2), np.int64)
         hy = np.empty(0)
         hX = np.empty((0, len(FEATURE_NAMES)))
-    if len(hy):
-        hs = clf.predict_proba(hX)[:, 1]
-        hold_ids = np.unique(hb)
-        gid_map = {int(v): k for k, v in enumerate(hold_ids)}
+    # Evaluate the holdout over EVERY held-out entity — including those that
+    # blocking left with zero candidates. Those entities are guaranteed misses
+    # (F=0) in the real metric, so a macro average that silently drops them
+    # overstates the score. We also report the blocking ceiling: the macro-F0.5
+    # a *perfect* scorer could reach with this candidate set.
+    hold_all = np.flatnonzero(ho)
+    if hold_all.size:
+        n_groups = int(hold_all.size)
+        gid_map = {int(v): k for k, v in enumerate(hold_all.tolist())}
         gids = np.fromiter(
             (gid_map[int(v)] for v in hb), dtype=np.int64, count=hb.size
         )
         truth_n = np.array(
-            [len(gt.get(s1_ids_list[int(v)], ())) for v in hold_ids],
+            [len(gt.get(s1_ids_list[int(v)], ())) for v in hold_all],
             dtype=np.float64,
         )
+        hy_f = hy.astype(np.float64)
+        hs = (clf.predict_proba(hX)[:, 1] if hX.shape[0]
+              else np.empty(0, dtype=np.float64))
+
+        tp_cap = np.bincount(gids, weights=hy_f, minlength=n_groups)
+        pos_links = float(truth_n.sum())
+        pair_recall = float(tp_cap.sum() / max(pos_links, 1.0))
+        full_recall = float((tp_cap >= truth_n).mean())
+        log(f"[train] holdout entities={n_groups:,} "
+            f"singletons={int((truth_n == 0).sum()):,} "
+            f"true_links={int(pos_links):,}")
+        log(f"[train] BLOCKING RECALL pair={pair_recall:.4f} "
+            f"entity-full={full_recall:.4f}")
+        with np.errstate(divide="ignore", invalid="ignore"):
+            r_cap = np.where(truth_n > 0, tp_cap / np.maximum(truth_n, 1), 1.0)
+        cap = float((1.25 * r_cap / (0.25 + r_cap)).mean())
+        log(f"[train] blocking CEILING macro-F0.5 (perfect precision) "
+            f"= {cap:.4f}")
+
         grid = np.round(np.arange(0.30, 0.901, 0.01), 4)
-        thr, val = _tune_threshold(
-            hs, hy.astype(np.float64), gids, len(hold_ids), truth_n, grid
-        )
-        log(f"[train] threshold={thr:.3f} holdout macro-F0.5={val:.4f}")
+        thr, val = _tune_threshold(hs, hy_f, gids, n_groups, truth_n, grid)
+        log(f"[train] tuned threshold={thr:.3f} holdout macro-F0.5={val:.4f}")
+        _report_curve(hs, hy_f, gids, n_groups, truth_n)
     else:
         thr, val = ScoringConfig().heuristic_threshold, float("nan")
         log("[train] empty holdout — defaulting threshold")
@@ -490,6 +562,11 @@ def _add_blocking_args(p) -> None:
                    default=BlockingConfig.max_pool_per_key)
     p.add_argument("--max-prod-per-key", type=int,
                    default=BlockingConfig.max_prod_per_key)
+    p.add_argument("--weak-keys", action="store_true",
+                   default=BlockingConfig.weak_keys,
+                   help="also emit the low-information coverage key families "
+                        "(unigrams/token-pairs/windows); measured to add no "
+                        "recall beyond what a higher --top-k already buys")
     p.add_argument("--workers", type=int, default=None,
                    help="feature-computation processes (default: cpus-1)")
 
