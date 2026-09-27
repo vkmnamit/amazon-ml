@@ -12,7 +12,9 @@ cd "$ROOT/code/business_entity_resolution"
 PY="$ROOT/.venv/bin/python"
 
 # 1) train -> artifacts/model.pkl + artifacts/threshold.json
-"$PY" -m src.pipeline train
+#    --max-train-s1 keeps peak RAM safe on a 16 GB machine (800k entities
+#    still give ~2.8M labeled positives for the 7-feature model).
+"$PY" -m src.pipeline train --max-train-s1 800000
 echo "TRAIN_RC=$?"
 
 # 2) predict -> output/matching_results.tsv + output/candidate_pairs.tsv

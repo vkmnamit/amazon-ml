@@ -345,6 +345,24 @@ def cmd_train(args) -> int:
     log(f"[train] S1={len(s1):,} pool={len(pool):,} gt_entities={len(gt):,} "
         f"[{time.time() - t0:.1f}s]")
 
+    # Memory budget for 16 GB machines: the 10M+ row pool plus the full GT
+    # dict plus feature matrices for all 2.2M S1 entities push the box into
+    # swap (which stalls feature workers to <5% CPU). A random subset of
+    # ~800k entities still yields ~2.8M labeled positives — plenty for a
+    # 7-feature model — and keeps peak RAM in the single-digit GB range.
+    max_train_s1 = getattr(args, "max_train_s1", 0)
+    if max_train_s1 and len(s1) > max_train_s1:
+        sampler = np.random.default_rng(7)
+        sel = np.sort(
+            sampler.choice(len(s1), size=max_train_s1, replace=False)
+        )
+        s1 = s1.iloc[sel].reset_index(drop=True)
+        kept_ids = frozenset(s1["entity_id"].tolist())
+        gt = {k: v for k, v in gt.items() if k in kept_ids}
+        del kept_ids
+        log(f"[train] sampled S1 -> {len(s1):,} entities, "
+            f"gt -> {len(gt):,} [{time.time() - t0:.1f}s]")
+
     s1_ids = s1["entity_id"].to_numpy(dtype=object)
     pool_ids = pool["entity_id"].to_numpy(dtype=object)
     ci, cj, _ = build_candidates(s1, pool, cfg, log=log)
@@ -511,6 +529,9 @@ def main(argv=None) -> int:
     p.add_argument("--train-dir", default="../../dataset/train")
     p.add_argument("--artifacts", default="../../artifacts")
     p.add_argument("--holdout-frac", type=float, default=0.15)
+    p.add_argument("--max-train-s1", type=int, default=800_000,
+                   help="memory budget: random S1 subset for training "
+                        "(0 = use all entities)")
     p.add_argument("--neg-sample", type=float, default=0.25,
                    help="fraction of negative candidate pairs to keep")
     p.add_argument("--max-iter", type=int, default=200)
