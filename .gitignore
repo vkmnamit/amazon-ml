@@ -6,4 +6,6 @@ __pycache__/
 dataset/
 output/*.npy
 output/*.tsv
+output_heuristic_059/
+*.tsv
 
